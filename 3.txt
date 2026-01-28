@@ -1,0 +1,190 @@
+"""
+FoundationPose STEP to OBJ Converter
+专为NVIDIA FoundationPose设计的转换工具
+支持STEP/STP文件转OBJ，包含可视化、网格优化和兼容性检查
+"""
+
+import os
+import sys
+import argparse
+import warnings
+import numpy as np
+from typing import Tuple, List, Optional, Dict, Any
+warnings.filterwarnings('ignore')
+
+# 尝试导入依赖库
+try:
+    from OCC.Core.STEPControl import STEPControl_Reader
+    from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
+    from OCC.Core.BRep import BRep_Tool
+    from OCC.Core.TopoDS import topods_Face
+    from OCC.Core.TopExp import TopExp_Explorer
+    from OCC.Core.TopAbs import TopAbs_FACE
+    from OCC.Core.gp import gp_Trsf
+    OCC_AVAILABLE = True
+except ImportError:
+    print("警告: pythonocc-core 未安装，将无法直接处理STEP文件")
+    print("安装命令: conda install -c conda-forge pythonocc-core=7.7.0")
+    OCC_AVAILABLE = False
+
+try:
+    import pyvista as pv
+    PVIZ_AVAILABLE = True
+except ImportError:
+    PVIZ_AVAILABLE = False
+
+try:
+    import trimesh
+    TRIMESH_AVAILABLE = True
+except ImportError:
+    TRIMESH_AVAILABLE = False
+
+try:
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+
+
+class STEPtoFPConverter:
+    """专门为FoundationPose优化的STEP转OBJ转换器"""
+    
+    def __init__(self, verbose: bool = True):
+        """
+        初始化转换器
+        
+        Args:
+            verbose: 是否显示详细信息
+        """
+        self.verbose = verbose
+        self.vertices = []
+        self.faces = []
+        self.normals = []
+        self.shape = None
+        
+        if not OCC_AVAILABLE:
+            raise ImportError("pythonocc-core未安装，无法处理STEP文件")
+    
+    def log(self, message: str):
+        """打印日志"""
+        if self.verbose:
+            print(f"[STEP2FP] {message}")
+    
+    def read_step_file(self, step_path: str) -> bool:
+        """
+        读取STEP文件
+        
+        Args:
+            step_path: STEP文件路径
+            
+        Returns:
+            bool: 是否成功
+        """
+        if not os.path.exists(step_path):
+            self.log(f"错误: 文件不存在 - {step_path}")
+            return False
+        
+        self.log(f"读取STEP文件: {step_path}")
+        
+        try:
+            reader = STEPControl_Reader()
+            status = reader.ReadFile(step_path)
+            
+            if status != 1:
+                self.log("错误: 无法读取STEP文件")
+                return False
+            
+            reader.TransferRoots()
+            self.shape = reader.OneShape()
+            
+            if self.shape.IsNull():
+                self.log("错误: 读取的STEP文件为空")
+                return False
+            
+            self.log(f"STEP文件读取成功")
+            return True
+            
+        except Exception as e:
+            self.log(f"读取STEP文件时出错: {str(e)}")
+            return False
+    
+    def triangulate(self, 
+                   linear_deflection: float = 0.01, 
+                   angular_deflection: float = 0.5,
+                   parallel: bool = True) -> bool:
+        """
+        三角化BREP形状
+        
+        Args:
+            linear_deflection: 线性偏差，越小精度越高
+            angular_deflection: 角度偏差，越小精度越高
+            parallel: 是否并行计算
+            
+        Returns:
+            bool: 是否成功
+        """
+        if self.shape is None:
+            self.log("错误: 未加载STEP文件")
+            return False
+        
+        self.log("开始三角化...")
+        
+        try:
+            # 创建网格化对象
+            mesh = BRepMesh_IncrementalMesh(
+                self.shape,
+                linear_deflection,
+                False,  # 不是相对模式
+                angular_deflection,
+                parallel
+            )
+            
+            # 执行网格化
+            mesh.Perform()
+            
+            if not mesh.IsDone():
+                self.log("警告: 网格化可能未完成")
+            
+            # 提取网格数据
+            success = self._extract_mesh_data()
+            
+            if success:
+                self.log(f"三角化完成 - 顶点数: {len(self.vertices)}, 面数: {len(self.faces)}")
+            
+            return success
+            
+        except Exception as e:
+            self.log(f"三角化时出错: {str(e)}")
+            return False
+    
+    def _extract_mesh_data(self) -> bool:
+        """
+        从三角化后的形状中提取网格数据
+        
+        Returns:
+            bool: 是否成功
+        """
+        self.vertices = []
+        self.faces = []
+        self.normals = []
+        
+        try:
+            # 顶点映射字典
+            vertex_map = {}
+            vertex_counter = 0
+            
+            # 遍历所有面
+            face_explorer = TopExp_Explorer(self.shape, TopAbs_FACE)
+            
+            while face_explorer.More():
+                face = topods_Face(face_explorer.Current())
+                triangulation = BRep_Tool.Triangulation(face, gp_Trsf())
+                
+                if triangulation and triangulation.NbTriangles() > 0:
+                    # 获取节点
+                    nodes = triangulation.Nodes()
+                    nb_nodes = triangulation.NbNodes()
+                    
+                
