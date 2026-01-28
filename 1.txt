@@ -1,0 +1,243 @@
+import pyrealsense2 as rs
+import numpy as np
+import open3d as o3d
+import cv2
+import time
+
+class RealsensePointCloud:
+    def __init__(self, use_external_intrinsics=False, custom_intrinsics=None):
+        """
+        初始化Realsense D435相机
+        
+        参数:
+        - use_external_intrinsics: 是否使用外部提供的相机内参
+        - custom_intrinsics: 自定义相机内参，格式为:
+            {
+                'width': 640,  # 图像宽度
+                'height': 480, # 图像高度
+                'fx': 617.3,   # 焦距x
+                'fy': 617.3,   # 焦距y
+                'ppx': 326.0,  # 主点x
+                'ppy': 245.0   # 主点y
+            }
+        """
+        self.pipeline = rs.pipeline()
+        self.config = rs.config()
+        
+        # 配置相机流
+        self.config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+        self.config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        
+        self.use_external_intrinsics = use_external_intrinsics
+        self.custom_intrinsics = custom_intrinsics
+        self.intrinsics = None
+        self.align = rs.align(rs.stream.color)
+        
+        # 点云可视化器
+        self.vis = o3d.visualization.Visualizer()
+        self.vis.create_window(window_name='Realsense D435 Point Cloud')
+        
+        # 点云对象
+        self.pcd = o3d.geometry.PointCloud()
+        self.first_frame = True
+        
+    def start(self):
+        """启动相机"""
+        profile = self.pipeline.start(self.config)
+        
+        # 获取深度传感器内参
+        if not self.use_external_intrinsics:
+            depth_profile = profile.get_stream(rs.stream.depth)
+            depth_intrinsics = depth_profile.as_video_stream_profile().get_intrinsics()
+            
+            self.intrinsics = {
+                'width': depth_intrinsics.width,
+                'height': depth_intrinsics.height,
+                'fx': depth_intrinsics.fx,
+                'fy': depth_intrinsics.fy,
+                'ppx': depth_intrinsics.ppx,
+                'ppy': depth_intrinsics.ppy
+            }
+            print("使用相机内置内参:")
+            print(f"  分辨率: {self.intrinsics['width']}x{self.intrinsics['height']}")
+            print(f"  焦距: fx={self.intrinsics['fx']:.2f}, fy={self.intrinsics['fy']:.2f}")
+            print(f"  主点: ppx={self.intrinsics['ppx']:.2f}, ppy={self.intrinsics['ppy']:.2f}")
+        else:
+            self.intrinsics = self.custom_intrinsics
+            print("使用外部提供的相机内参")
+            print(f"  分辨率: {self.intrinsics['width']}x{self.intrinsics['height']}")
+            print(f"  焦距: fx={self.intrinsics['fx']:.2f}, fy={self.intrinsics['fy']:.2f}")
+            print(f"  主点: ppx={self.intrinsics['ppx']:.2f}, ppy={self.intrinsics['ppy']:.2f}")
+    
+    def stop(self):
+        """停止相机"""
+        self.pipeline.stop()
+        self.vis.destroy_window()
+        cv2.destroyAllWindows()
+    
+    def get_frames(self):
+        """获取对齐后的帧"""
+        frames = self.pipeline.wait_for_frames()
+        aligned_frames = self.align.process(frames)
+        
+        depth_frame = aligned_frames.get_depth_frame()
+        color_frame = aligned_frames.get_color_frame()
+        
+        if not depth_frame or not color_frame:
+            return None, None
+        
+        depth_image = np.asanyarray(depth_frame.get_data())
+        color_image = np.asanyarray(color_frame.get_data())
+        
+        return depth_image, color_image
+    
+    def depth_to_pointcloud(self, depth_image, color_image):
+        """
+        将深度图转换为点云
+        
+        参数:
+        - depth_image: 深度图像
+        - color_image: 彩色图像
+        
+        返回:
+        - point_cloud: Open3D点云对象
+        """
+        # 创建深度图像的内参矩阵
+        intrinsics_matrix = o3d.camera.PinholeCameraIntrinsic()
+        intrinsics_matrix.set_intrinsics(
+            self.intrinsics['width'],
+            self.intrinsics['height'],
+            self.intrinsics['fx'],
+            self.intrinsics['fy'],
+            self.intrinsics['ppx'],
+            self.intrinsics['ppy']
+        )
+        
+        # 将深度图像转换为Open3D格式
+        depth_o3d = o3d.geometry.Image(depth_image.astype(np.float32))
+        
+        # 将彩色图像转换为Open3D格式（需要转换为RGB格式）
+        color_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+        color_o3d = o3d.geometry.Image(color_rgb)
+        
+        # 创建RGBD图像
+        rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            color_o3d,
+            depth_o3d,
+            depth_scale=1000.0,  # Realsense深度单位为毫米
+            depth_trunc=3.0,     # 截断距离（米）
+            convert_rgb_to_intensity=False
+        )
+        
+        # 生成点云
+        point_cloud = o3d.geometry.PointCloud.create_from_rgbd_image(
+            rgbd_image,
+            intrinsics_matrix
+        )
+        
+        # 变换点云坐标（可选：使相机朝向正前方）
+        point_cloud.transform([[1, 0, 0, 0],
+                               [0, -1, 0, 0],
+                               [0, 0, -1, 0],
+                               [0, 0, 0, 1]])
+        
+        return point_cloud
+    
+    def visualize_pointcloud(self, point_cloud):
+        """可视化点云"""
+        if self.first_frame:
+            self.vis.add_geometry(point_cloud)
+            self.first_frame = False
+        else:
+            self.pcd.points = point_cloud.points
+            self.pcd.colors = point_cloud.colors
+            self.vis.update_geometry(self.pcd)
+        
+        self.vis.poll_events()
+        self.vis.update_renderer()
+    
+    def run(self):
+        """主循环：捕获数据并可视化"""
+        try:
+            self.start()
+            print("相机启动成功！按 'q' 退出，按 's' 保存当前点云")
+            
+            while True:
+                # 获取帧
+                depth_image, color_image = self.get_frames()
+                
+                if depth_image is None or color_image is None:
+                    continue
+                
+                # 转换深度图为点云
+                point_cloud = self.depth_to_pointcloud(depth_image, color_image)
+                
+                # 可视化点云
+                self.visualize_pointcloud(point_cloud)
+                
+                # 显示彩色图像和深度图像（可选）
+                depth_colormap = cv2.applyColorMap(
+                    cv2.convertScaleAbs(depth_image, alpha=0.03), 
+                    cv2.COLORMAP_JET
+                )
+                
+                cv2.imshow('RGB Image', color_image)
+                cv2.imshow('Depth Image', depth_colormap)
+                
+                # 键盘控制
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    print("退出程序")
+                    break
+                elif key == ord('s'):
+                    # 保存点云
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    filename = f"pointcloud_{timestamp}.ply"
+                    o3d.io.write_point_cloud(filename, point_cloud)
+                    print(f"点云已保存为: {filename}")
+                
+                # 控制帧率
+                time.sleep(0.01)
+                
+        except Exception as e:
+            print(f"发生错误: {e}")
+        finally:
+            self.stop()
+
+def main():
+    """
+    主函数
+    可以选择使用相机内置内参或自定义内参
+    """
+    
+    # 选项1：使用相机内置内参（默认）
+    print("选项1：使用相机内置内参")
+    pc_viewer = RealsensePointCloud(use_external_intrinsics=False)
+    
+    # 选项2：使用自定义内参（如果需要）
+    # 注意：以下内参值仅为示例，实际使用时需要根据相机标定结果填写
+    """
+    custom_intrinsics = {
+        'width': 640,
+        'height': 480,
+        'fx': 617.3,    # 这些值需要根据实际标定结果填写
+        'fy': 617.3,
+        'ppx': 326.0,
+        'ppy': 245.0
+    }
+    print("选项2：使用自定义内参")
+    pc_viewer = RealsensePointCloud(
+        use_external_intrinsics=True,
+        custom_intrinsics=custom_intrinsics
+    )
+    """
+    
+    # 运行点云可视化
+    pc_viewer.run()
+
+if __name__ == "__main__":
+    # 安装依赖（如果尚未安装）
+    print("确保已安装以下依赖：")
+    print("pip install pyrealsense2 open3d opencv-python numpy")
+    
+    main()
