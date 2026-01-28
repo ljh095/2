@@ -1,0 +1,1120 @@
+FoundationPose STEP转OBJ转换器
+
+我将为您创建一个专门为NVIDIA FoundationPose优化的完整转换工具。这个工具集成了STEP到OBJ的转换、网格优化、可视化以及FoundationPose兼容性检查。
+
+```python
+"""
+FoundationPose STEP to OBJ Converter
+专为NVIDIA FoundationPose设计的转换工具
+支持STEP/STP文件转OBJ，包含可视化、网格优化和兼容性检查
+"""
+
+import os
+import sys
+import argparse
+import warnings
+import numpy as np
+from typing import Tuple, List, Optional, Dict, Any
+warnings.filterwarnings('ignore')
+
+# 尝试导入依赖库
+try:
+    from OCC.Core.STEPControl import STEPControl_Reader
+    from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
+    from OCC.Core.BRep import BRep_Tool
+    from OCC.Core.TopoDS import topods_Face
+    from OCC.Core.TopExp import TopExp_Explorer
+    from OCC.Core.TopAbs import TopAbs_FACE
+    from OCC.Core.gp import gp_Trsf
+    OCC_AVAILABLE = True
+except ImportError:
+    print("警告: pythonocc-core 未安装，将无法直接处理STEP文件")
+    print("安装命令: conda install -c conda-forge pythonocc-core=7.7.0")
+    OCC_AVAILABLE = False
+
+try:
+    import pyvista as pv
+    PVIZ_AVAILABLE = True
+except ImportError:
+    PVIZ_AVAILABLE = False
+
+try:
+    import trimesh
+    TRIMESH_AVAILABLE = True
+except ImportError:
+    TRIMESH_AVAILABLE = False
+
+try:
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+
+
+class STEPtoFPConverter:
+    """专门为FoundationPose优化的STEP转OBJ转换器"""
+    
+    def __init__(self, verbose: bool = True):
+        """
+        初始化转换器
+        
+        Args:
+            verbose: 是否显示详细信息
+        """
+        self.verbose = verbose
+        self.vertices = []
+        self.faces = []
+        self.normals = []
+        self.shape = None
+        
+        if not OCC_AVAILABLE:
+            raise ImportError("pythonocc-core未安装，无法处理STEP文件")
+    
+    def log(self, message: str):
+        """打印日志"""
+        if self.verbose:
+            print(f"[STEP2FP] {message}")
+    
+    def read_step_file(self, step_path: str) -> bool:
+        """
+        读取STEP文件
+        
+        Args:
+            step_path: STEP文件路径
+            
+        Returns:
+            bool: 是否成功
+        """
+        if not os.path.exists(step_path):
+            self.log(f"错误: 文件不存在 - {step_path}")
+            return False
+        
+        self.log(f"读取STEP文件: {step_path}")
+        
+        try:
+            reader = STEPControl_Reader()
+            status = reader.ReadFile(step_path)
+            
+            if status != 1:
+                self.log("错误: 无法读取STEP文件")
+                return False
+            
+            reader.TransferRoots()
+            self.shape = reader.OneShape()
+            
+            if self.shape.IsNull():
+                self.log("错误: 读取的STEP文件为空")
+                return False
+            
+            self.log(f"STEP文件读取成功")
+            return True
+            
+        except Exception as e:
+            self.log(f"读取STEP文件时出错: {str(e)}")
+            return False
+    
+    def triangulate(self, 
+                   linear_deflection: float = 0.01, 
+                   angular_deflection: float = 0.5,
+                   parallel: bool = True) -> bool:
+        """
+        三角化BREP形状
+        
+        Args:
+            linear_deflection: 线性偏差，越小精度越高
+            angular_deflection: 角度偏差，越小精度越高
+            parallel: 是否并行计算
+            
+        Returns:
+            bool: 是否成功
+        """
+        if self.shape is None:
+            self.log("错误: 未加载STEP文件")
+            return False
+        
+        self.log("开始三角化...")
+        
+        try:
+            # 创建网格化对象
+            mesh = BRepMesh_IncrementalMesh(
+                self.shape,
+                linear_deflection,
+                False,  # 不是相对模式
+                angular_deflection,
+                parallel
+            )
+            
+            # 执行网格化
+            mesh.Perform()
+            
+            if not mesh.IsDone():
+                self.log("警告: 网格化可能未完成")
+            
+            # 提取网格数据
+            success = self._extract_mesh_data()
+            
+            if success:
+                self.log(f"三角化完成 - 顶点数: {len(self.vertices)}, 面数: {len(self.faces)}")
+            
+            return success
+            
+        except Exception as e:
+            self.log(f"三角化时出错: {str(e)}")
+            return False
+    
+    def _extract_mesh_data(self) -> bool:
+        """
+        从三角化后的形状中提取网格数据
+        
+        Returns:
+            bool: 是否成功
+        """
+        self.vertices = []
+        self.faces = []
+        self.normals = []
+        
+        try:
+            # 顶点映射字典
+            vertex_map = {}
+            vertex_counter = 0
+            
+            # 遍历所有面
+            face_explorer = TopExp_Explorer(self.shape, TopAbs_FACE)
+            
+            while face_explorer.More():
+                face = topods_Face(face_explorer.Current())
+                triangulation = BRep_Tool.Triangulation(face, gp_Trsf())
+                
+                if triangulation and triangulation.NbTriangles() > 0:
+                    # 获取节点
+                    nodes = triangulation.Nodes()
+                    nb_nodes = triangulation.NbNodes()
+                    
+                    # 处理顶点
+                    for i in range(1, nb_nodes + 1):
+                        node = nodes.Value(i)
+                        vertex_key = (node.X(), node.Y(), node.Z())
+                        
+                        if vertex_key not in vertex_map:
+                            vertex_map[vertex_key] = vertex_counter
+                            self.vertices.append([node.X(), node.Y(), node.Z()])
+                            vertex_counter += 1
+                    
+                    # 获取三角形
+                    triangles = triangulation.Triangles()
+                    nb_triangles = triangulation.NbTriangles()
+                    
+                    # 处理三角形
+                    for i in range(1, nb_triangles + 1):
+                        triangle = triangles.Value(i)
+                        
+                        # 获取顶点索引
+                        idx1 = triangle.Value(1)
+                        idx2 = triangle.Value(2)
+                        idx3 = triangle.Value(3)
+                        
+                        v1 = vertex_map[(
+                            nodes.Value(idx1).X(),
+                            nodes.Value(idx1).Y(),
+                            nodes.Value(idx1).Z()
+                        )]
+                        v2 = vertex_map[(
+                            nodes.Value(idx2).X(),
+                            nodes.Value(idx2).Y(),
+                            nodes.Value(idx2).Z()
+                        )]
+                        v3 = vertex_map[(
+                            nodes.Value(idx3).X(),
+                            nodes.Value(idx3).Y(),
+                            nodes.Value(idx3).Z()
+                        )]
+                        
+                        # 添加到面列表 (0-based索引)
+                        self.faces.append([v1, v2, v3])
+                        
+                        # 计算面法向量
+                        normal = self._calculate_face_normal(
+                            self.vertices[v1],
+                            self.vertices[v2],
+                            self.vertices[v3]
+                        )
+                        self.normals.append(normal)
+                
+                face_explorer.Next()
+            
+            return True
+            
+        except Exception as e:
+            self.log(f"提取网格数据时出错: {str(e)}")
+            return False
+    
+    def _calculate_face_normal(self, v1: List[float], v2: List[float], v3: List[float]) -> List[float]:
+        """
+        计算三角形面法向量
+        
+        Args:
+            v1, v2, v3: 三角形顶点
+            
+        Returns:
+            归一化的法向量
+        """
+        # 转换为numpy数组
+        v1_np = np.array(v1)
+        v2_np = np.array(v2)
+        v3_np = np.array(v3)
+        
+        # 计算边向量
+        edge1 = v2_np - v1_np
+        edge2 = v3_np - v1_np
+        
+        # 叉积得到法向量
+        normal = np.cross(edge1, edge2)
+        
+        # 归一化
+        norm = np.linalg.norm(normal)
+        if norm > 0:
+            normal = normal / norm
+        
+        return normal.tolist()
+    
+    def save_obj(self, output_path: str, export_normals: bool = True) -> bool:
+        """
+        保存为OBJ文件
+        
+        Args:
+            output_path: 输出文件路径
+            export_normals: 是否导出法向量
+            
+        Returns:
+            bool: 是否成功
+        """
+        if not self.vertices or not self.faces:
+            self.log("错误: 没有网格数据可保存")
+            return False
+        
+        self.log(f"保存为OBJ文件: {output_path}")
+        
+        try:
+            with open(output_path, 'w') as f:
+                # 写入文件头
+                f.write("# OBJ file generated by FoundationPose STEP Converter\n")
+                f.write(f"# Vertices: {len(self.vertices)}\n")
+                f.write(f"# Faces: {len(self.faces)}\n")
+                f.write(f"# For NVIDIA FoundationPose\n\n")
+                
+                # 写入顶点
+                for v in self.vertices:
+                    f.write(f"v {v[0]:.8f} {v[1]:.8f} {v[2]:.8f}\n")
+                
+                # 写入法向量 (每个面一个法向量)
+                if export_normals and self.normals:
+                    f.write("\n# Face normals\n")
+                    for n in self.normals:
+                        f.write(f"vn {n[0]:.8f} {n[1]:.8f} {n[2]:.8f}\n")
+                
+                # 写入面
+                f.write("\n# Faces\n")
+                if export_normals and self.normals:
+                    # 每个面使用相同的法向量索引
+                    for i, face in enumerate(self.faces):
+                        f.write(f"f {face[0]+1}//{i+1} {face[1]+1}//{i+1} {face[2]+1}//{i+1}\n")
+                else:
+                    for face in self.faces:
+                        f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+            
+            self.log(f"OBJ文件保存成功")
+            return True
+            
+        except Exception as e:
+            self.log(f"保存OBJ文件时出错: {str(e)}")
+            return False
+    
+    def get_mesh_data(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        获取网格数据
+        
+        Returns:
+            vertices: 顶点数组 (N, 3)
+            faces: 面索引数组 (M, 3)
+        """
+        vertices_array = np.array(self.vertices, dtype=np.float32)
+        faces_array = np.array(self.faces, dtype=np.int32)
+        
+        return vertices_array, faces_array
+    
+    def optimize_for_foundationpose(self, 
+                                   target_size: float = 1.0,
+                                   compute_vertex_normals: bool = True) -> Dict[str, Any]:
+        """
+        为FoundationPose优化网格
+        
+        Args:
+            target_size: 目标模型大小
+            compute_vertex_normals: 是否计算顶点法向量
+            
+        Returns:
+            优化统计信息
+        """
+        if not TRIMESH_AVAILABLE:
+            self.log("警告: trimesh未安装，无法进行高级优化")
+            self.log("安装命令: pip install trimesh")
+            return {"status": "skipped", "reason": "trimesh not available"}
+        
+        if not self.vertices or not self.faces:
+            self.log("错误: 没有网格数据")
+            return {"status": "error", "reason": "no mesh data"}
+        
+        self.log("开始FoundationPose优化...")
+        
+        try:
+            # 创建trimesh对象
+            vertices_np = np.array(self.vertices)
+            faces_np = np.array(self.faces)
+            
+            mesh = trimesh.Trimesh(vertices=vertices_np, faces=faces_np)
+            
+            # 1. 确保是三角网格
+            if not mesh.is_empty:
+                if not mesh.is_watertight:
+                    self.log("警告: 网格不是水密的，可能会影响渲染")
+                
+                # 2. 计算顶点法向量（如果需要）
+                if compute_vertex_normals:
+                    if mesh.vertex_normals is None or len(mesh.vertex_normals) == 0:
+                        mesh.compute_vertex_normals()
+                        self.log("计算了顶点法向量")
+                
+                # 3. 归一化尺寸
+                original_extents = mesh.extents.copy()
+                
+                # 移动到原点
+                mesh.apply_translation(-mesh.centroid)
+                
+                # 计算缩放因子
+                max_extent = max(mesh.extents)
+                if max_extent > 0:
+                    scale_factor = target_size / max_extent
+                    mesh.apply_scale(scale_factor)
+                    
+                    self.log(f"模型归一化: 原始尺寸 {original_extents} -> 新尺寸 {mesh.extents}")
+                
+                # 4. 更新数据
+                self.vertices = mesh.vertices.tolist()
+                self.faces = mesh.faces.tolist()
+                
+                # 5. 重新计算面法向量
+                self.normals = []
+                for face in self.faces:
+                    normal = self._calculate_face_normal(
+                        self.vertices[face[0]],
+                        self.vertices[face[1]],
+                        self.vertices[face[2]]
+                    )
+                    self.normals.append(normal)
+                
+                # 6. 检查网格质量
+                stats = {
+                    "status": "success",
+                    "vertex_count": len(self.vertices),
+                    "face_count": len(self.faces),
+                    "extents": mesh.extents.tolist(),
+                    "volume": mesh.volume if hasattr(mesh, 'volume') else 0,
+                    "watertight": mesh.is_watertight,
+                    "is_triangulated": True
+                }
+                
+                self.log(f"优化完成: {stats['vertex_count']} 顶点, {stats['face_count']} 面")
+                return stats
+                
+        except Exception as e:
+            self.log(f"优化过程中出错: {str(e)}")
+            return {"status": "error", "reason": str(e)}
+    
+    def convert(self, 
+               step_path: str, 
+               output_path: Optional[str] = None,
+               linear_deflection: float = 0.01,
+               angular_deflection: float = 0.5,
+               optimize: bool = True,
+               target_size: float = 1.0) -> Optional[str]:
+        """
+        完整的转换流程
+        
+        Args:
+            step_path: 输入STEP文件路径
+            output_path: 输出OBJ文件路径
+            linear_deflection: 线性偏差
+            angular_deflection: 角度偏差
+            optimize: 是否进行FoundationPose优化
+            target_size: 优化后的目标尺寸
+            
+        Returns:
+            OBJ文件路径，失败时返回None
+        """
+        try:
+            # 1. 读取STEP文件
+            if not self.read_step_file(step_path):
+                return None
+            
+            # 2. 三角化
+            if not self.triangulate(linear_deflection, angular_deflection):
+                return None
+            
+            # 3. 优化（可选）
+            if optimize:
+                self.optimize_for_foundationpose(target_size)
+            
+            # 4. 确定输出路径
+            if output_path is None:
+                base_name = os.path.splitext(os.path.basename(step_path))[0]
+                output_dir = "fp_models"
+                os.makedirs(output_dir, exist_ok=True)
+                output_path = os.path.join(output_dir, f"{base_name}.obj")
+            
+            # 5. 保存OBJ文件
+            if not self.save_obj(output_path):
+                return None
+            
+            return output_path
+            
+        except Exception as e:
+            self.log(f"转换过程中出错: {str(e)}")
+            return None
+
+
+class FoundationPoseValidator:
+    """FoundationPose兼容性验证器"""
+    
+    @staticmethod
+    def validate_obj_for_foundationpose(obj_path: str) -> Dict[str, Any]:
+        """
+        验证OBJ文件是否兼容FoundationPose
+        
+        Args:
+            obj_path: OBJ文件路径
+            
+        Returns:
+            验证结果
+        """
+        if not TRIMESH_AVAILABLE:
+            return {"status": "error", "reason": "trimesh not available"}
+        
+        if not os.path.exists(obj_path):
+            return {"status": "error", "reason": "file not found"}
+        
+        try:
+            # 加载网格
+            mesh = trimesh.load(obj_path)
+            
+            # 检查项目
+            checks = {
+                "文件存在": True,
+                "可以加载": True,
+                "顶点数": len(mesh.vertices),
+                "面数": len(mesh.faces),
+                "是否三角化": mesh.faces.shape[1] == 3,
+                "是否有顶点法向量": mesh.vertex_normals is not None and len(mesh.vertex_normals) > 0,
+                "是否水密": mesh.is_watertight,
+                "边界尺寸": mesh.extents.tolist(),
+                "体积": mesh.volume if hasattr(mesh, 'volume') else 0,
+                "是否有纹理": mesh.visual.kind != 'empty'
+            }
+            
+            # 评估兼容性
+            compatibility = True
+            issues = []
+            
+            if not checks["是否三角化"]:
+                compatibility = False
+                issues.append("网格不是三角化网格")
+            
+            if not checks["是否有顶点法向量"]:
+                issues.append("缺少顶点法向量（可能影响渲染）")
+            
+            if not checks["是否水密"]:
+                issues.append("网格不是水密的（可能影响渲染质量）")
+            
+            # 检查尺寸是否合理
+            max_dim = max(checks["边界尺寸"])
+            if max_dim > 10.0 or max_dim < 0.1:
+                issues.append(f"模型尺寸可能不合适: {checks['边界尺寸']}")
+            
+            checks["兼容性"] = compatibility
+            checks["问题"] = issues
+            checks["建议"] = []
+            
+            # 提供建议
+            if not checks["是否三角化"]:
+                checks["建议"].append("使用mesh.triangulate()进行三角化")
+            
+            if not checks["是否有顶点法向量"]:
+                checks["建议"].append("使用mesh.compute_vertex_normals()计算法向量")
+            
+            if len(checks["建议"]) == 0:
+                checks["建议"].append("模型已准备好用于FoundationPose")
+            
+            return checks
+            
+        except Exception as e:
+            return {"status": "error", "reason": str(e)}
+
+
+class MeshVisualizer:
+    """网格可视化工具"""
+    
+    @staticmethod
+    def visualize_mesh(obj_path: str, title: str = "FoundationPose Model"):
+        """
+        可视化OBJ网格
+        
+        Args:
+            obj_path: OBJ文件路径
+            title: 可视化标题
+        """
+        if PVIZ_AVAILABLE:
+            MeshVisualizer._visualize_with_pyvista(obj_path, title)
+        elif MATPLOTLIB_AVAILABLE:
+            MeshVisualizer._visualize_with_matplotlib(obj_path, title)
+        else:
+            print("警告: 未安装可视化库，无法显示3D模型")
+            print("安装命令: pip install pyvista matplotlib")
+    
+    @staticmethod
+    def _visualize_with_pyvista(obj_path: str, title: str):
+        """使用PyVista进行高质量可视化"""
+        try:
+            import pyvista as pv
+            
+            print(f"使用PyVista可视化: {obj_path}")
+            
+            # 读取网格
+            mesh = pv.read(obj_path)
+            
+            # 创建绘图窗口
+            plotter = pv.Plotter(window_size=[1200, 800])
+            plotter.set_background('white')
+            
+            # 添加网格
+            plotter.add_mesh(
+                mesh, 
+                color='lightblue',
+                show_edges=True,
+                edge_color='black',
+                line_width=1,
+                opacity=0.9
+            )
+            
+            # 添加坐标轴和标题
+            plotter.add_axes(line_width=5)
+            plotter.add_title(title, font_size=20)
+            
+            # 添加网格信息文本
+            info_text = f"""
+            顶点数: {mesh.n_points}
+            面数: {mesh.n_cells}
+            尺寸: {mesh.bounds}
+            """
+            plotter.add_text(info_text, position='lower_left', font_size=10)
+            
+            # 显示
+            plotter.show()
+            
+        except Exception as e:
+            print(f"PyVista可视化失败: {e}")
+            MeshVisualizer._visualize_with_matplotlib(obj_path, title)
+    
+    @staticmethod
+    def _visualize_with_matplotlib(obj_path: str, title: str):
+        """使用Matplotlib进行基础可视化"""
+        try:
+            # 简单的OBJ读取
+            vertices, faces = MeshVisualizer._read_simple_obj(obj_path)
+            
+            if vertices is None or faces is None:
+                print("无法读取OBJ文件")
+                return
+            
+            # 创建图形
+            fig = plt.figure(figsize=(10, 8))
+            ax = fig.add_subplot(111, projection='3d')
+            
+            # 绘制网格
+            triangles = vertices[faces]
+            mesh = Poly3DCollection(
+                triangles,
+                alpha=0.8,
+                facecolors='lightblue',
+                edgecolors='black',
+                linewidths=0.5
+            )
+            ax.add_collection3d(mesh)
+            
+            # 设置坐标轴
+            ax.set_xlabel('X')
+            ax.set_ylabel('Y')
+            ax.set_zlabel('Z')
+            ax.set_title(title)
+            
+            # 自动调整视图
+            ax.auto_scale_xyz(vertices[:, 0], vertices[:, 1], vertices[:, 2])
+            
+            # 显示信息
+            info_text = f"顶点数: {len(vertices)}\n面数: {len(faces)}"
+            ax.text2D(0.05, 0.95, info_text, transform=ax.transAxes, fontsize=10,
+                     verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            
+            plt.tight_layout()
+            plt.show()
+            
+        except Exception as e:
+            print(f"Matplotlib可视化失败: {e}")
+    
+    @staticmethod
+    def _read_simple_obj(obj_path: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """简单的OBJ文件读取器"""
+        vertices = []
+        faces = []
+        
+        try:
+            with open(obj_path, 'r') as f:
+                for line in f:
+                    if line.startswith('v '):
+                        parts = line.strip().split()
+                        if len(parts) >= 4:
+                            vertices.append([float(parts[1]), float(parts[2]), float(parts[3])])
+                    elif line.startswith('f '):
+                        parts = line.strip().split()
+                        face_vertices = []
+                        for part in parts[1:]:
+                            # 处理顶点索引（可能包含纹理/法线索引）
+                            vertex_idx = part.split('/')[0]
+                            if vertex_idx:
+                                face_vertices.append(int(vertex_idx) - 1)  # 转为0-based索引
+                        
+                        if len(face_vertices) >= 3:
+                            # 如果是多边形，分解为三角形
+                            for i in range(1, len(face_vertices) - 1):
+                                faces.append([face_vertices[0], face_vertices[i], face_vertices[i+1]])
+            
+            return np.array(vertices), np.array(faces)
+            
+        except Exception as e:
+            print(f"读取OBJ文件时出错: {e}")
+            return None, None
+
+
+def batch_convert_for_foundationpose(input_dir: str, 
+                                   output_dir: str = "foundationpose_models",
+                                   pattern: str = "*.step") -> List[str]:
+    """
+    批量转换STEP文件
+    
+    Args:
+        input_dir: 输入目录
+        output_dir: 输出目录
+        pattern: 文件匹配模式
+        
+    Returns:
+        成功转换的文件列表
+    """
+    import glob
+    
+    # 创建输出目录
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 查找STEP文件
+    step_files = glob.glob(os.path.join(input_dir, pattern))
+    step_files.extend(glob.glob(os.path.join(input_dir, "*.stp")))
+    
+    if not step_files:
+        print(f"在 {input_dir} 中未找到STEP文件")
+        return []
+    
+    print(f"找到 {len(step_files)} 个STEP文件")
+    
+    # 转换每个文件
+    successful_conversions = []
+    
+    for i, step_file in enumerate(step_files, 1):
+        print(f"\n[{i}/{len(step_files)}] 处理: {os.path.basename(step_file)}")
+        
+        try:
+            # 创建转换器
+            converter = STEPtoFPConverter(verbose=True)
+            
+            # 转换文件
+            base_name = os.path.splitext(os.path.basename(step_file))[0]
+            output_path = os.path.join(output_dir, f"{base_name}.obj")
+            
+            obj_path = converter.convert(
+                step_path=step_file,
+                output_path=output_path,
+                linear_deflection=0.01,
+                optimize=True
+            )
+            
+            if obj_path and os.path.exists(obj_path):
+                successful_conversions.append(obj_path)
+                
+                # 验证文件
+                validator = FoundationPoseValidator()
+                result = validator.validate_obj_for_foundationpose(obj_path)
+                
+                if result.get("兼容性", False):
+                    print(f"  ✅ 成功转换并通过验证: {os.path.basename(obj_path)}")
+                else:
+                    print(f"  ⚠️  成功转换但有警告: {os.path.basename(obj_path)}")
+                    if "问题" in result:
+                        for issue in result["问题"]:
+                            print(f"    - {issue}")
+            else:
+                print(f"  ❌ 转换失败: {os.path.basename(step_file)}")
+                
+        except Exception as e:
+            print(f"  ❌ 处理失败: {e}")
+    
+    # 生成报告
+    if successful_conversions:
+        print(f"\n{'='*60}")
+        print(f"批量转换完成!")
+        print(f"成功: {len(successful_conversions)}/{len(step_files)}")
+        print(f"输出目录: {output_dir}")
+        print(f"{'='*60}")
+        
+        # 生成说明文件
+        readme_path = os.path.join(output_dir, "README_FOR_FOUNDATIONPOSE.txt")
+        with open(readme_path, 'w') as f:
+            f.write("="*60 + "\n")
+            f.write("FoundationPose 模型文件说明\n")
+            f.write("="*60 + "\n\n")
+            f.write("这些模型文件已经过优化，可直接用于NVIDIA FoundationPose。\n\n")
+            f.write("模型特性:\n")
+            f.write("- 已三角化\n")
+            f.write("- 尺寸归一化\n")
+            f.write("- 包含法向量\n")
+            f.write("- 适合6D姿态估计\n\n")
+            f.write("文件列表:\n")
+            for i, model in enumerate(successful_conversions, 1):
+                f.write(f"{i}. {os.path.basename(model)}\n")
+            f.write("\n使用方法:\n")
+            f.write("1. 在FoundationPose配置文件中指定模型路径\n")
+            f.write("2. 确保模型尺寸符合场景要求\n")
+            f.write("3. 如有需要，可进一步调整材质和纹理\n")
+        
+        print(f"说明文件已生成: {readme_path}")
+    
+    return successful_conversions
+
+
+def main():
+    """主函数 - 命令行接口"""
+    parser = argparse.ArgumentParser(
+        description="FoundationPose STEP转OBJ转换器",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用示例:
+  # 单个文件转换
+  python step2fp.py model.step -o model.obj --visualize
+  
+  # 批量转换目录中的所有STEP文件
+  python step2fp.py --batch ./step_files --output ./fp_models
+  
+  # 高精度转换
+  python step2fp.py model.step --linear 0.005 --angular 0.3
+  
+  # 验证OBJ文件
+  python step2fp.py --validate model.obj
+  
+  # 可视化OBJ文件
+  python step2fp.py --visualize-only model.obj
+        """
+    )
+    
+    # 输入参数
+    parser.add_argument("input", nargs="?", help="输入STEP文件或目录")
+    
+    # 输出参数
+    parser.add_argument("-o", "--output", help="输出OBJ文件路径")
+    parser.add_argument("--output-dir", default="fp_models", help="输出目录（批量转换时使用）")
+    
+    # 转换参数
+    parser.add_argument("--linear", type=float, default=0.01, 
+                       help="线性偏差（默认: 0.01，值越小精度越高）")
+    parser.add_argument("--angular", type=float, default=0.5,
+                       help="角度偏差（默认: 0.5，值越小精度越高）")
+    parser.add_argument("--target-size", type=float, default=1.0,
+                       help="目标模型尺寸（默认: 1.0）")
+    parser.add_argument("--no-optimize", action="store_true",
+                       help="不进行FoundationPose优化")
+    
+    # 操作模式
+    parser.add_argument("--batch", action="store_true",
+                       help="批量转换模式（input应为目录）")
+    parser.add_argument("--validate", action="store_true",
+                       help="验证模式（验证OBJ文件兼容性）")
+    parser.add_argument("--visualize", action="store_true",
+                       help="转换后可视化模型")
+    parser.add_argument("--visualize-only", action="store_true",
+                       help="仅可视化OBJ文件（不转换）")
+    
+    # 其他参数
+    parser.add_argument("--quiet", action="store_true",
+                       help="静默模式，减少输出")
+    
+    args = parser.parse_args()
+    
+    # 检查依赖
+    if not OCC_AVAILABLE and not (args.validate or args.visualize_only):
+        print("错误: pythonocc-core未安装，无法进行STEP转换")
+        print("安装命令:")
+        print("  conda install -c conda-forge pythonocc-core=7.7.0")
+        print("或")
+        print("  pip install OCC-Core==7.7.0")
+        return 1
+    
+    # 处理不同模式
+    if args.validate and args.input:
+        # 验证模式
+        if args.input.lower().endswith(('.obj')):
+            validator = FoundationPoseValidator()
+            result = validator.validate_obj_for_foundationpose(args.input)
+            
+            print("\n" + "="*60)
+            print(f"FoundationPose兼容性验证: {os.path.basename(args.input)}")
+            print("="*60)
+            
+            for key, value in result.items():
+                if key in ["status", "reason"]:
+                    continue
+                if isinstance(value, bool):
+                    status = "✅" if value else "❌"
+                    print(f"{status} {key}: {value}")
+                elif isinstance(value, list):
+                    if key == "问题" and value:
+                        print(f"⚠️  {key}:")
+                        for item in value:
+                            print(f"    - {item}")
+                    elif key == "建议" and value:
+                        print(f"💡 {key}:")
+                        for item in value:
+                            print(f"    - {item}")
+                    else:
+                        print(f"📊 {key}: {value}")
+                else:
+                    print(f"📊 {key}: {value}")
+            
+            if result.get("兼容性", False):
+                print("\n🎉 模型兼容FoundationPose!")
+            else:
+                print("\n⚠️  模型可能需要调整才能用于FoundationPose")
+            
+            return 0
+    
+    elif args.visualize_only and args.input:
+        # 仅可视化模式
+        if args.input.lower().endswith(('.obj')):
+            MeshVisualizer.visualize_mesh(args.input, "FoundationPose Model")
+            return 0
+        else:
+            print("错误: 输入文件必须是OBJ格式")
+            return 1
+    
+    elif args.batch and args.input:
+        # 批量转换模式
+        if os.path.isdir(args.input):
+            successful = batch_convert_for_foundationpose(
+                input_dir=args.input,
+                output_dir=args.output_dir
+            )
+            return 0 if successful else 1
+        else:
+            print("错误: 批量模式需要输入目录")
+            return 1
+    
+    elif args.input:
+        # 单个文件转换模式
+        if not os.path.exists(args.input):
+            print(f"错误: 文件不存在 - {args.input}")
+            return 1
+        
+        if args.input.lower().endswith(('.step', '.stp')):
+            # 创建转换器
+            converter = STEPtoFPConverter(verbose=not args.quiet)
+            
+            # 执行转换
+            obj_path = converter.convert(
+                step_path=args.input,
+                output_path=args.output,
+                linear_deflection=args.linear,
+                angular_deflection=args.angular,
+                optimize=not args.no_optimize,
+                target_size=args.target_size
+            )
+            
+            if obj_path:
+                print(f"\n✅ 转换成功: {obj_path}")
+                
+                # 验证文件
+                validator = FoundationPoseValidator()
+                result = validator.validate_obj_for_foundationpose(obj_path)
+                
+                print(f"\n📊 转换统计:")
+                print(f"  顶点数: {len(converter.vertices)}")
+                print(f"  面数: {len(converter.faces)}")
+                print(f"  尺寸: {np.array(converter.vertices).max(axis=0) - np.array(converter.vertices).min(axis=0)}")
+                
+                if result.get("兼容性", False):
+                    print("  ✅ FoundationPose兼容性: 通过")
+                else:
+                    print("  ⚠️  FoundationPose兼容性: 有警告")
+                    if "问题" in result:
+                        for issue in result["问题"]:
+                            print(f"    - {issue}")
+                
+                # 可视化
+                if args.visualize:
+                    MeshVisualizer.visualize_mesh(obj_path, "FoundationPose Model")
+                
+                # FoundationPose使用提示
+                print(f"\n🎯 FoundationPose使用说明:")
+                print(f"1. 将模型文件复制到您的FoundationPose项目目录")
+                print(f"2. 在配置文件中指定模型路径:")
+                print(f"   model:")
+                print(f"     path: \"path/to/{os.path.basename(obj_path)}\"")
+                print(f"     scale: 1.0  # 如有需要可调整")
+                print(f"3. 确保模型在场景中的尺寸合适")
+                print(f"4. 如有纹理需求，可添加对应的MTL和纹理文件")
+                
+                return 0
+            else:
+                print("❌ 转换失败")
+                return 1
+        else:
+            print("错误: 输入文件必须是STEP格式 (.step, .stp)")
+            return 1
+    
+    else:
+        # 无输入参数，显示帮助
+        parser.print_help()
+        
+        # 显示安装状态
+        print(f"\n📦 依赖状态:")
+        print(f"  pythonocc-core: {'✅ 已安装' if OCC_AVAILABLE else '❌ 未安装'}")
+        print(f"  trimesh: {'✅ 已安装' if TRIMESH_AVAILABLE else '⚠️  未安装（影响优化功能）'}")
+        print(f"  pyvista: {'✅ 已安装' if PVIZ_AVAILABLE else '⚠️  未安装（影响高质量可视化）'}")
+        print(f"  matplotlib: {'✅ 已安装' if MATPLOTLIB_AVAILABLE else '⚠️  未安装（影响基础可视化）'}")
+        
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+安装脚本
+
+创建一个安装脚本来确保所有依赖都正确安装：
+
+```bash
+#!/bin/bash
+# install_dependencies.sh
+
+echo "正在安装 FoundationPose STEP 转换器依赖..."
+
+# 检查conda是否可用
+if command -v conda &> /dev/null; then
+    echo "使用conda安装pythonocc-core..."
+    conda install -c conda-forge pythonocc-core=7.7.0 -y
+else
+    echo "使用pip安装OCC..."
+    pip install OCC-Core==7.7.0
+fi
+
+# 安装其他依赖
+echo "安装其他依赖库..."
+pip install numpy matplotlib pyvista trimesh
+
+# 安装pyvista的附加组件（可选）
+pip install pyvistaqt  # 用于交互式可视化
+
+echo "安装完成！"
+echo ""
+echo "使用方法："
+echo "  单个文件转换: python step2fp.py model.step -o model.obj --visualize"
+echo "  批量转换: python step2fp.py --batch ./step_files"
+echo "  验证模型: python step2fp.py --validate model.obj"
+```
+
+使用示例
+
+1. 基本使用
+
+```bash
+# 转换单个STEP文件
+python step2fp.py model.step -o model.obj --visualize
+
+# 高精度转换
+python step2fp.py model.step --linear 0.005 --angular 0.3
+
+# 不进行优化（保持原始尺寸）
+python step2fp.py model.step --no-optimize
+```
+
+2. 批量处理
+
+```bash
+# 批量转换目录中的所有STEP文件
+python step2fp.py --batch ./step_files --output-dir ./foundationpose_models
+```
+
+3. 验证和可视化
+
+```bash
+# 验证OBJ文件是否兼容FoundationPose
+python step2fp.py --validate model.obj
+
+# 仅可视化OBJ文件
+python step2fp.py --visualize-only model.obj
+```
+
+4. 在Python代码中使用
+
+```python
+from step2fp import STEPtoFPConverter, FoundationPoseValidator, MeshVisualizer
+
+# 转换STEP文件
+converter = STEPtoFPConverter()
+obj_path = converter.convert(
+    step_path="input.step",
+    output_path="output.obj",
+    linear_deflection=0.01,
+    optimize=True
+)
+
+# 验证文件
+validator = FoundationPoseValidator()
+result = validator.validate_obj_for_foundationpose(obj_path)
+
+# 可视化
+if result.get("兼容性", False):
+    MeshVisualizer.visualize_mesh(obj_path)
+```
+
+功能特性
+
+1. 完整的STEP到OBJ转换：支持所有常见的STEP/STP文件格式
+2. FoundationPose优化：
+   · 自动三角化网格
+   · 尺寸归一化
+   · 法向量计算
+   · 兼容性检查
+3. 多种可视化选项：
+   · PyVista高质量可视化
+   · Matplotlib基础可视化
+4. 批量处理：支持批量转换整个目录
+5. 详细的验证报告：检查模型是否适合FoundationPose
+6. 命令行界面：易于集成到工作流程中
+
+这个工具专门为NVIDIA FoundationPose设计，确保生成的OBJ文件满足6D姿态估计的要求。
