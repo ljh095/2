@@ -1,0 +1,248 @@
+import numpy as np
+import os
+
+def read_obj_file(file_path):
+    """读取OBJ文件，返回顶点坐标、面数据和其他信息"""
+    vertices = []
+    faces = []
+    vertex_normals = []
+    texture_coords = []
+    
+    with open(file_path, 'r') as f:
+        for line in f:
+            if line.startswith('v '):  # 顶点坐标
+                parts = line.strip().split()[1:]
+                vertices.append([float(parts[0]), float(parts[1]), float(parts[2])])
+            elif line.startswith('f '):  # 面
+                face = []
+                for part in line.strip().split()[1:]:
+                    # 处理 f v/vt/vn 格式
+                    vertex_indices = part.split('/')
+                    face.append(int(vertex_indices[0]))
+                faces.append(face)
+            elif line.startswith('vn '):  # 法线
+                parts = line.strip().split()[1:]
+                vertex_normals.append([float(parts[0]), float(parts[1]), float(parts[2])])
+            elif line.startswith('vt '):  # 纹理坐标
+                parts = line.strip().split()[1:]
+                if len(parts) >= 2:
+                    texture_coords.append([float(parts[0]), float(parts[1])])
+    
+    return np.array(vertices), faces, np.array(vertex_normals), np.array(texture_coords)
+
+def normalize_model(vertices, method='unit_cube'):
+    """
+    归一化模型
+    
+    参数:
+    vertices: 顶点坐标数组
+    method: 归一化方法
+        'unit_cube' - 归一化到单位立方体 [-0.5, 0.5]
+        'unit_sphere' - 归一化到单位球体
+        'zero_center' - 仅中心化到原点
+        'unit_scale' - 缩放至单位大小
+    """
+    vertices = vertices.copy()
+    
+    # 计算包围盒
+    min_coords = np.min(vertices, axis=0)
+    max_coords = np.max(vertices, axis=0)
+    center = (min_coords + max_coords) / 2.0
+    size = max_coords - min_coords
+    max_size = np.max(size)
+    
+    print(f"原始模型信息:")
+    print(f"  顶点数量: {len(vertices)}")
+    print(f"  包围盒大小: {size}")
+    print(f"  中心点位置: {center}")
+    print(f"  最大尺寸: {max_size}")
+    
+    if method == 'unit_cube':
+        # 归一化到单位立方体 [-0.5, 0.5]
+        vertices = vertices - center
+        if max_size > 0:
+            vertices = vertices / max_size
+        print("  归一化方法: 单位立方体 [-0.5, 0.5]")
+        
+    elif method == 'unit_sphere':
+        # 归一化到单位球体
+        vertices = vertices - center
+        max_distance = np.max(np.linalg.norm(vertices, axis=1))
+        if max_distance > 0:
+            vertices = vertices / (2 * max_distance)  # 半径为0.5
+        print("  归一化方法: 单位球体")
+        
+    elif method == 'zero_center':
+        # 仅中心化到原点
+        vertices = vertices - center
+        print("  归一化方法: 仅中心化")
+        
+    elif method == 'unit_scale':
+        # 缩放至单位大小
+        vertices = vertices - center
+        if max_size > 0:
+            vertices = vertices / max_size
+        # 缩放到[-1, 1]范围
+        vertices = vertices * 2
+        print("  归一化方法: 单位缩放 [-1, 1]")
+    
+    # 计算归一化后的信息
+    norm_min = np.min(vertices, axis=0)
+    norm_max = np.max(vertices, axis=0)
+    norm_size = norm_max - norm_min
+    norm_center = (norm_min + norm_max) / 2.0
+    
+    print(f"\n归一化后模型信息:")
+    print(f"  包围盒范围: [{norm_min[0]:.3f}, {norm_max[0]:.3f}] x [{norm_min[1]:.3f}, {norm_max[1]:.3f}] x [{norm_min[2]:.3f}, {norm_max[2]:.3f}]")
+    print(f"  包围盒大小: {norm_size}")
+    print(f"  中心点位置: {norm_center}")
+    
+    return vertices
+
+def write_obj_file(file_path, vertices, faces, vertex_normals=None, texture_coords=None):
+    """将数据写入OBJ文件"""
+    with open(file_path, 'w') as f:
+        # 写入顶点
+        for v in vertices:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        
+        # 写入纹理坐标（如果有）
+        if texture_coords is not None and len(texture_coords) > 0:
+            for vt in texture_coords:
+                if len(vt) >= 2:
+                    f.write(f"vt {vt[0]:.6f} {vt[1]:.6f}\n")
+        
+        # 写入法线（如果有）
+        if vertex_normals is not None and len(vertex_normals) > 0:
+            for vn in vertex_normals:
+                f.write(f"vn {vn[0]:.6f} {vn[1]:.6f} {vn[2]:.6f}\n")
+        
+        # 写入面
+        for face in faces:
+            face_str = 'f'
+            for v_idx in face:
+                face_str += f' {v_idx}'
+            f.write(face_str + '\n')
+
+def normalize_obj_file(input_file, output_file=None, method='unit_cube'):
+    """
+    读取OBJ文件，归一化后保存
+    
+    参数:
+    input_file: 输入OBJ文件路径
+    output_file: 输出OBJ文件路径（如为None，则在原文件名后加_norm）
+    method: 归一化方法
+    """
+    if not os.path.exists(input_file):
+        print(f"错误: 文件 {input_file} 不存在！")
+        return False
+    
+    if output_file is None:
+        name, ext = os.path.splitext(input_file)
+        output_file = f"{name}_norm{ext}"
+    
+    print(f"正在处理文件: {input_file}")
+    
+    # 读取OBJ文件
+    vertices, faces, vertex_normals, texture_coords = read_obj_file(input_file)
+    
+    if len(vertices) == 0:
+        print("错误: 文件中没有找到顶点数据！")
+        return False
+    
+    # 归一化处理
+    normalized_vertices = normalize_model(vertices, method)
+    
+    # 写入输出文件
+    write_obj_file(output_file, normalized_vertices, faces, vertex_normals, texture_coords)
+    
+    print(f"\n归一化完成！结果已保存到: {output_file}")
+    return True
+
+def visualize_model(vertices, faces):
+    """可选：使用matplotlib可视化模型（需要安装matplotlib）"""
+    try:
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D
+        
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # 绘制顶点
+        ax.scatter(vertices[:, 0], vertices[:, 1], vertices[:, 2], 
+                  c='b', marker='o', s=10, alpha=0.6)
+        
+        # 绘制包围盒
+        min_coords = np.min(vertices, axis=0)
+        max_coords = np.max(vertices, axis=0)
+        
+        # 创建包围盒的顶点
+        box_vertices = np.array([
+            [min_coords[0], min_coords[1], min_coords[2]],
+            [max_coords[0], min_coords[1], min_coords[2]],
+            [max_coords[0], max_coords[1], min_coords[2]],
+            [min_coords[0], max_coords[1], min_coords[2]],
+            [min_coords[0], min_coords[1], max_coords[2]],
+            [max_coords[0], min_coords[1], max_coords[2]],
+            [max_coords[0], max_coords[1], max_coords[2]],
+            [min_coords[0], max_coords[1], max_coords[2]]
+        ])
+        
+        # 绘制包围盒的边
+        edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7)
+        ]
+        
+        for edge in edges:
+            ax.plot3D([box_vertices[edge[0]][0], box_vertices[edge[1]][0]],
+                     [box_vertices[edge[0]][1], box_vertices[edge[1]][1]],
+                     [box_vertices[edge[0]][2], box_vertices[edge[1]][2]], 'r-', alpha=0.5)
+        
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        ax.set_title('归一化后的模型')
+        ax.grid(True)
+        
+        # 设置坐标轴范围
+        ax.set_xlim([-0.6, 0.6])
+        ax.set_ylim([-0.6, 0.6])
+        ax.set_zlim([-0.6, 0.6])
+        
+        plt.tight_layout()
+        plt.show()
+        
+    except ImportError:
+        print("注意: 要可视化模型，请先安装 matplotlib: pip install matplotlib")
+
+# 使用示例
+if __name__ == "__main__":
+    # 示例1：简单使用
+    input_obj = "model.obj"  # 替换为你的OBJ文件路径
+    output_obj = "model_normalized.obj"
+    
+    # 归一化方法可选: 'unit_cube', 'unit_sphere', 'zero_center', 'unit_scale'
+    normalize_obj_file(input_obj, output_obj, method='unit_cube')
+    
+    # 示例2：批量处理
+    def batch_normalize_obj_files(folder_path, method='unit_cube'):
+        """批量处理文件夹中的所有OBJ文件"""
+        import glob
+        
+        obj_files = glob.glob(os.path.join(folder_path, "*.obj"))
+        for obj_file in obj_files:
+            print(f"\n{'='*50}")
+            print(f"处理文件: {obj_file}")
+            normalize_obj_file(obj_file, method=method)
+    
+    # 示例3：直接使用函数处理
+    # 读取OBJ文件
+    # vertices, faces, vertex_normals, texture_coords = read_obj_file("input.obj")
+    
+    # 归一化
+    # normalized_vertices = normalize_model(vertices, method='unit_cube')
+    
+    # 可视化（需要matplotlib）
+    # visualize_model(normalized_vertices, faces)
